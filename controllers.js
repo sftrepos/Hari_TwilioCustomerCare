@@ -1,11 +1,20 @@
+/* eslint-disable no-console */
 const twilio = require("twilio");
+// eslint-disable-next-line no-unused-vars
 const moment = require("moment");
 const momentTz = require("moment-timezone");
 const uniqid = require("uniqid");
-const redis = require("redis");
-const redisPub = redis.createClient();
+const Redis = require("ioredis");
+const redisPub = new Redis();
 
-const { accountSid, authToken, publicUrl, fromNumber, agentNumber } = require("./config");
+const {
+  accountSid,
+  authToken,
+  publicUrl,
+  fromNumber,
+  agentNumbers,
+  agentSips
+} = require("./config");
 const twilioClient = twilio(accountSid, authToken);
 const voiceResponse = twilio.twiml.VoiceResponse;
 
@@ -16,8 +25,9 @@ exports.customerenqueue = async (req, res, next) => {
       .format("HH");
 
     const roomName = uniqid();
-
     const twilioVoiceResponse = new voiceResponse();
+
+    var response = "";
 
     if (hour === 0 || hour < 12) {
       response = "Morning";
@@ -32,28 +42,12 @@ exports.customerenqueue = async (req, res, next) => {
         Please wait for the next available
         Agent`;
 
-    if (response === "Morning") {
-      await twilioVoiceResponse.say(Greeting);
-      await twilioVoiceResponse.enqueue({}, roomName);
-      await redisPub.publish("room name", roomName);
+    await twilioVoiceResponse.say(Greeting);
+    await twilioVoiceResponse.enqueue({}, roomName);
+    await redisPub.publish("room name", roomName);
 
-      res.type("text/xml");
-      return res.send(twilioVoiceResponse.toString());
-    } else if (response === "Afternoon") {
-      await twilioVoiceResponse.say(Greeting);
-      await twilioVoiceResponse.enqueue({}, roomName);
-      await redisPub.publish("room name", roomName);
-
-      res.type("text/xml");
-      return res.send(twilioVoiceResponse.toString());
-    } else if (response === "Evening") {
-      await twilioVoiceResponse.say(Greeting);
-      await twilioVoiceResponse.enqueue({}, roomName);
-      await redisPub.publish("room name", roomName);
-
-      res.type("text/xml");
-      return res.send(twilioVoiceResponse.toString());
-    }
+    res.type("text/xml");
+    return res.send(twilioVoiceResponse.toString());
   } catch (error) {
     return next(error);
   }
@@ -63,10 +57,19 @@ exports.agentdequeue = async (req, res, next) => {
   try {
     const { roomName } = req.query;
 
-    await twilioClient.calls.create({
-      from: fromNumber,
-      to: agentNumber,
-      url: `${publicUrl}/agentgather?roomName=${roomName}`
+    const agentContacts = [...agentNumbers, ...agentSips];
+
+    await agentContacts.forEach(async contact => {
+      const call = await twilioClient.calls.create({
+        from: fromNumber,
+        to: contact,
+        url: `${publicUrl}/agentgather?roomName=${roomName}`,
+        statusCallback: `${publicUrl}/terminatecalls?roomName=${roomName}`,
+        statusCallbackEvent: ["answered"],
+        statusCallbackMethod: "POST"
+      });
+
+      await redisPub.rpush(roomName, call.sid);
     });
 
     return res.json({
@@ -131,6 +134,28 @@ exports.agentprocess = async (req, res, next) => {
       res.type("text/xml");
       return res.send(twilioVoiceResponse.toString());
     }
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.terminatecalls = async (req, res, next) => {
+  try {
+    const { roomName } = req.query;
+    const { CallSid } = req.body;
+
+    await redisPub.lrem(roomName, 0, CallSid);
+    const roomCalls = await redisPub.lrange(roomName, 0, -1);
+
+    await roomCalls.forEach(async call => {
+      await twilioClient.calls(call).update({ status: "completed" });
+    });
+
+    await redisPub.del(roomName);
+
+    return res.json({
+      success: true
+    });
   } catch (error) {
     return next(error);
   }
