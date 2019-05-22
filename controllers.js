@@ -52,7 +52,7 @@ exports.customerenqueue = async (req, res, next) => {
     await twilioVoiceResponse.say(Greeting);
     await twilioVoiceResponse.enqueue(
       {
-        waitUrl: `${publicUrl}/customerwaiturlgather`,
+        waitUrl: `${publicUrl}/customerwaiturlgather?roomName=${roomName}`,
         action: `${publicUrl}/customerenqueueaction?roomName=${roomName}`
       },
       roomName
@@ -72,6 +72,8 @@ exports.customerenqueueaction = async (req, res, next) => {
     const { roomName } = req.query;
     const { QueueResult, QueueTime } = req.body;
 
+    const callerNumber = await redisPub.get(`$callernumber${roomName}`);
+
     if (QueueResult === "hangup") {
       const roomCalls = await redisPub.lrange(roomName, 0, -1);
       await roomCalls.forEach(async call => {
@@ -88,7 +90,7 @@ exports.customerenqueueaction = async (req, res, next) => {
         body: {
           sender: { email: fromEmail },
           to: [{ email: toEmail }],
-          textContent: `You have a missed call ringing for ${QueueTime} seconds. Please check your call logs.`,
+          textContent: `You have a missed call from ${callerNumber} ringing for ${QueueTime} seconds. Please check your call logs.`,
           subject: "Customer Missed Call",
           "replyTo.email": fromEmail
         },
@@ -133,9 +135,16 @@ exports.customerenqueueaction = async (req, res, next) => {
 
 exports.customerrecordprocess = async (req, res, next) => {
   try {
+
+    const { IsRedirected } = req.query;
+
     const twilioVoiceResponse = new voiceResponse();
 
     await twilioVoiceResponse.pause({ length: 1 });
+    if(IsRedirected == "True"){
+      await twilioVoiceResponse.say("You will be automatically redirected to our voicemail")
+      await twilioVoiceResponse.pause({ length: 1 });
+    }
     await twilioVoiceResponse.say("Please record your message after the Beep.");
     await twilioVoiceResponse.record({
       action: `${publicUrl}/customerrecordaction`,
@@ -152,7 +161,29 @@ exports.customerrecordprocess = async (req, res, next) => {
 
 exports.customerwaiturlgather = async (req, res, next) => {
   try {
-    const { QueueTime } = req.body;
+    const { QueueTime, QueueSid } = req.body;
+
+    const { roomName } = req.query;
+
+    var callerNumber = await redisPub.get(`$callernumber${roomName}`);
+
+    if(!callerNumber){
+
+      const QueueMembers = await twilioClient.queues(QueueSid).members.list({limit: 20});
+
+      const FirstQueueMemeber = await QueueMembers.filter(function(item){
+        return item.position == 1;
+      })
+
+      const customerCallSid = await FirstQueueMemeber[0].callSid;
+
+      const callDetails = await twilioClient.calls(customerCallSid).fetch()
+
+      callerNumber = callDetails.from;
+
+      await redisPub.set(`$callernumber${roomName}`,callerNumber);
+
+    }
 
     const twilioVoiceResponse = new voiceResponse();
 
@@ -166,7 +197,7 @@ exports.customerwaiturlgather = async (req, res, next) => {
       return res.send(twilioVoiceResponse.toString());
     } else {
       const gather = twilioVoiceResponse.gather({
-        action: `${publicUrl}/customerwaiturlprocess`,
+        action: `${publicUrl}/customerwaiturlprocess?roomName=${roomName}`,
         method: "POST",
         numDigits: 1
       });
@@ -185,6 +216,7 @@ exports.customerwaiturlgather = async (req, res, next) => {
 exports.customerwaiturlprocess = async (req, res, next) => {
   try {
     const { Digits } = req.body;
+    const { roomName } = req.query;
 
     const twilioVoiceResponse = new voiceResponse();
 
@@ -200,7 +232,7 @@ exports.customerwaiturlprocess = async (req, res, next) => {
       return res.send(twilioVoiceResponse.toString());
     } else {
       await twilioVoiceResponse.say("Sorry. That is a wrong input.");
-      await twilioVoiceResponse.redirect(`${publicUrl}/customerwaiturlgather`);
+      await twilioVoiceResponse.redirect(`${publicUrl}/customerwaiturlgather?roomName=${roomName}`);
 
       res.type("text/xml");
       return res.send(twilioVoiceResponse.toString());
@@ -362,7 +394,7 @@ exports.agentprocess = async (req, res, next) => {
       await twilioClient
         .queues(currentQueueSid)
         .members(activeMemberCallSid)
-        .update({ url: `${publicUrl}/customerrecordprocess`, method: "POST" });
+        .update({ url: `${publicUrl}/customerrecordprocess?IsRedirected=True`, method: "POST" });
 
       await twilioVoiceResponse.hangup();
 
